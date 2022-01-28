@@ -40,6 +40,7 @@ class TreeNode:
       node.children.append(child.deep_copy())
     return node
 
+
   def merge_time(self, node):
     # assert len(self.children) == len(node.children)
     self.runTime += node.runTime
@@ -94,8 +95,8 @@ class TreeNode:
   def print_call_tree(self, maxDepth=1):
 
     def help_print(root, maxDepth, total, indent):
-      print(indent + root.name + '  {:.2e}  {:.4f}  {:d}'.format(\
-              root.runTime, root.runTime/total, root.count))
+      print(indent + ' {:<40} {:.2e}  {:.4f}  {:d}'.format(\
+              root.name, root.runTime, root.runTime/total, root.count))
       if maxDepth > 0:
         for child in root.children:
           help_print(child, maxDepth-1, root.runTime, indent+'  ')
@@ -104,11 +105,6 @@ class TreeNode:
     if maxDepth > 0:
       for child in self.children:
         help_print(child, maxDepth-1, self.runTime, '  ')
-
-    #print(indent + self.name + '  {:.2e}'.format(self.runTime))
-    #if maxDepth > 0:
-      #for child in self.children:
-        #child.print_call_tree(maxDepth-1, indent+'  ')
 
 
   def search(self, nameList):
@@ -151,29 +147,98 @@ class TreeNode:
     return res.runTime
 
 
-def build_call_tree(fname):
+#-------------------------------------------------------------------
+# functions creating call trees
+#-------------------------------------------------------------------
+
+
+def build_calltree_list(path, nProc, fileType='binary', endian='little', \
+                        longIntSize=8, main=None):
+  '''
+    Build call trees based on AMReX Base profiling, one tree per process.
+
+    Input:
+    path        - path to where base profiling data are stored
+    nProc       - number of process profiled
+    fileType    - This is for backward consistency with my old implementation,
+                  will be remove in future
+    endian      -
+    longIntSize - depends on where the profiling is performed
+    main        - the name of the main function of the top profiled function
+                  that calls child functions. If not specified, tree node will
+                  be a dummy node with depth -1 to encapsulate all the profiled
+                  functions.
+  '''
+
+  assert endian.lower() in ['little', 'big']
+  assert longIntSize == 4 or longIntSize == 8
+  assert fileType.lower() in ['ascii', 'binary']
+
+  if fileType.lower() == 'binary':
+    prefix = '/bl_call_stats_H_'
+  else:
+    prefix = '/bl_call_stats_D_'
+
+  roots = []
+  for i in range(nProc):
+    fname = path + prefix + '{:05d}'.format(i)
+    roots.append(build_call_tree(fname, fileType=fileType, endian=endian, \
+                                 longIntSize=longIntSize, main=main))
+    roots[-1].merge_same_subtrees()
+
+  return roots
+
+
+def build_call_tree(fname, endian='little', longIntSize=8, fileType='binary', main=None):
+  endianChar = '<' if endian.lower() == 'little' else '>'
+  root = None
+  if fileType.lower() == 'ascii':
+    root = build_from_ascii(fname, main)
+  elif fileType.lower() == 'binary':
+    # amrex bl region type
+    RegionType = np.dtype([('rssTime',    endianChar+'f8'),
+                           ('rssRNumber', endianChar+'i4'),
+                           ('rssStart',   endianChar+'i4'),])
+    # amrex bl call status type
+    CallType   = np.dtype([('depth',     endianChar+'i4'),
+                           ('fnameId',   endianChar+'i4'),
+                           ('nCSCalls',  endianChar+'i'+repr(longIntSize)),
+                           ('totalTime', endianChar+'f8'),
+                           ('stackTime', endianChar+'f8'),
+                           ('callTime',  endianChar+'f8'),])
+    root = build_from_binary(fname, RegionType, CallType, main)
+
+  return root
+
+
+def build_from_ascii(fname, main):
   callStack = []
-  root      = None
-  # namePattern = re.compile(r'[a-zA-Z()\-: ]*')
+  seekMain  = not (main == None)
+  mainFound = False
+  root      = None if seekMain else TreeNode(Call('root', -1, 0.0))
+  node      = root
+
   with open(fname, 'r') as callFile:
-    findMain = False
     for iline, line in enumerate(callFile):
       # name = namePattern.search(line).group()
       items = line.split()
       call  = Call(' '.join(items[:-3]), int(items[-3]), float(items[-1]))
-      if call.name == 'main()':
-        findMain = True
-        root     = TreeNode(call)
-        node     = root
-      # calls functions called in main()
-      elif findMain:
+
+      if seekMain:
+        if call.name == main:
+          mainFound = True
+          root      = TreeNode(call)
+          node      = root
+
+      if mainFound or (not seekMain):
         # pop out deeper calls and rewind tree node tracker
-        while call.depth <= callStack[-1].depth:
+        while len(callStack) > 0 and call.depth <= callStack[-1].depth:
           callStack.pop()
           node = node.parent
         # append call to parent node and stack
-        node.children.append(TreeNode(call, node))
+        node.children.append(TreeNode(call, parent=node))
         node = node.children[-1]
+
       # push node to stack
       callStack.append(call)
 
@@ -189,11 +254,85 @@ def merge_node_list(nodeList):
   return res
 
 
+def build_from_binary(fnameH, RegionType, CallType, main):
+  # header file
+  fHeader = open(fnameH, 'r')
+  lines   = fHeader.readlines()
+
+  # first line
+  items  = lines[0].strip().split()
+  nRss   = int(items[3]) # number of RStartStop (AMReX_BLProfiler.H)
+  nCall  = int(items[5]) # number of call statuses
+
+  # lines for function name and its number
+  # construct a map <int, functionName>
+  funcIdNameMap = {}
+  for line in lines[1:-1]:
+    items = line.strip().split('"')
+    funcIdNameMap[int(items[2].strip())] = items[1]
+  fHeader.close()
+
+  # read binary file to a buffer
+  # the data file's name is different than header's
+  # by replacing _H_ with _D_
+  fBin    = open('_D_'.join(fnameH.rsplit('_H_', 1)), 'rb')
+  buffer  = fBin.read()
+  fBin.close()
+  # load region and call data from buffer
+  regionData = np.frombuffer(buffer, dtype=RegionType, count=nRss)
+  callData   = np.frombuffer(buffer, dtype=CallType, count=nCall, \
+                             offset=regionData.nbytes)
+
+  callStack = []
+  seekMain  = not (main == None)
+  mainFound = False
+  root      = None if seekMain else TreeNode(Call('root', -1, 0.0))
+  node      = root
+
+  # setup call tree
+  for callStat in callData[1:]:
+    call = Call(funcIdNameMap[callStat['fnameId']], \
+                callStat['depth'], \
+                callStat['totalTime'])
+
+    if seekMain and not mainFound:
+      if call.name == main:
+        mainFound = True
+        root      = TreeNode(call)
+        node      = root
+        continue
+
+    if mainFound or (not seekMain):
+      # pop out deeper calls and rewind tree node tracker
+      while len(callStack) > 0 and call.depth <= callStack[-1].depth:
+        callStack.pop()
+        node = node.parent
+      # append call to parent node and stack
+      node.children.append(TreeNode(call, parent=node))
+      node = node.children[-1]
+      # push node to stack
+      callStack.append(call)
+
+  if seekMain and not mainFound:
+    print("Error: cannot find input function " + main)
+
+  return root
+
+
 #-------------------------------------------------------------------
 # functions extracting info from call trees
 #-------------------------------------------------------------------
 
+
 def extract_runtime(roots, callPaths):
+  '''
+    Give a list of (partial) call paths, find the matching full pathes
+    and get the time cost of the paths'last functions.
+
+    Return:
+    a list of times corresponding to the input list of paths
+  '''
+
   times = []
   for callPath in callPaths:
     callPathTime = []
@@ -204,6 +343,21 @@ def extract_runtime(roots, callPaths):
 
 
 def print_runtime(roots, callPath, depth=1, pid=-1):
+  '''
+    Given a (partial) call path, find the matching full paths and print
+    out the last function's child functions' call counts and time costs.
+
+    Note that if multiple full paths are found, they will merged into
+    one path. Unless intended, it is better to specify the input path
+    with sufficient functions so that only the full path of interest is
+    matched.
+
+    Inputs:
+    roots    - list of call tree roots
+    callPath - a (partial) call path to be searched in the call tree
+    depth    - number of levels of children functions to be printed
+    pid      - process id
+  '''
   for i, root in enumerate(roots):
     if pid >= 0 and pid < len(roots) and i != pid: continue
     nodeList = root.search(callPath)
@@ -216,17 +370,41 @@ def print_runtime(roots, callPath, depth=1, pid=-1):
     print()
 
 
-def print_callpath(roots, searchPath, pid=-1):
+def print_callpath(roots, searchPath, sortBy='count', pid=-1, nPrint=5):
+  '''
+    Give a (partial) call path, print out full call pathes that contains
+    the input (partial) path.
+
+    Inputs:
+    roots      - list of call tree roots
+    searchPath - a (partial) call path to be searched in the call tree
+    sortBy     - a key by which sort the found pathes. This can either be
+                 call count or time cost.
+    pid        - process id
+    nPrint     - number of top pathes to be printed
+  '''
+  assert sortBy.lower() in ['count', 'time']
+  assert pid < len(roots)
+
+  if sortBy.lower() == 'count':
+    sortKey, sortKind = 1, 'referenced'
+  else:
+    sortKey, sortKind = 2, 'expensive'
+
   for i, root in enumerate(roots):
     if pid >= 0 and pid < len(roots) and i != pid: continue
     nodeList = root.search(searchPath)
     print('-------- processes {:d} --------'.format(i))
-    print('find {:d} paths and print few frequently called ones'.format(len(nodeList)))
+    print('find {:d} paths and print the most {} ones'.format(\
+          len(nodeList), sortKind))
+    # sort node by its call count
     nodeCallCounts = []
     for node in nodeList:
-      nodeCallCounts.append((node, node.count))
-    nodeCallCounts.sort(key=lambda x: x[1], reverse=True)
-    for j in range(min(5, len(nodeCallCounts))):
+      nodeCallCounts.append((node, node.count, node.runTime))
+
+    nodeCallCounts.sort(key=lambda x: x[sortKey], reverse=True)
+    # print the most frequently called nodes
+    for j in range(min(nPrint, len(nodeCallCounts))):
       node = nodeCallCounts[j][0]
       # find the call path by backtracking
       path = []
@@ -234,8 +412,10 @@ def print_callpath(roots, searchPath, pid=-1):
         path.append(node.name)
         node = node.parent
       path.reverse()
-      #
-      print('{} {:.4e}'.format(nodeCallCounts[j][1], nodeCallCounts[j][0].runTime), end='  ')
+      # print the count, time cost, full path
+      print('{} {:.4e}'.format(nodeCallCounts[j][1], \
+                               nodeCallCounts[j][0].runTime), \
+                               end='  ')
       for k, name in enumerate(path):
         if k < len(path) - 1:
           print(name + ' -> ', end='')
@@ -246,6 +426,7 @@ def print_callpath(roots, searchPath, pid=-1):
 #-------------------------------------------------------------------
 # functions extracting info from mfix's stdout
 #-------------------------------------------------------------------
+
 
 def read_step_time(filepath):
   '''
