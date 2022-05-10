@@ -14,7 +14,7 @@ from amrex_profiling_parser import *
 # individual function calls. The call tree merges call paths with same function
 # names e.g., calls of the same function at different iterations.
 
-roots = build_calltree_list(path='./bl_prof_bin', nProc=18)
+roots = build_calltree_list(path='../mfix_post/bl_prof_bin', nProc=18)
 
 # this also works if you profile the main function and name the profiler 'main()'.
 # roots = build_calltree_list(path='./bl_prof_bin', nProc=18, main='main()')
@@ -50,7 +50,7 @@ print_runtime(roots, callPath, depth=1, pid=4)
 # Each function's cost are is the sum over its calls in both mac and nodal projector.
 callPath = ['mfix_solve','mfix::EvolveFluid',
             'MLMG::mgVcycle()']
-print_runtime(roots, callPath, depth=1, pid=4)
+print_runtime(roots, callPath, depth=3, pid=4)
 
 # %%
 # This module comes handy when one wants to generate performance plots for slides/reports.
@@ -96,7 +96,7 @@ callPaths = [
   ['mfix::compute_MAC_projected_velocities()', 'MLMG::mgVcycle()',
    'MLMG::mgVcycle_bottom',],
   ['mfix::compute_MAC_projected_velocities()', 'MLMG::mgVcycle()',
-   'MLEBABecLap::applyBC()',],
+   'MLEBABecLap::applyBC()', 'FabArray::FillBoundary()',],
   ['mfix::compute_MAC_projected_velocities()', 'MLMG::mgVcycle()',
    'MLEBABecLap::Fsmooth()',],
 ]
@@ -108,14 +108,10 @@ w = 0.6
 ranks = [repr(i) for i in range(nProc)]
 others = times[0]-times[1]-times[2]-times[3]
 fig = plt.figure(figsize=(8,4))
-plt.bar(ranks, times[2], label='gmg comm', width=w)
-plt.bar(ranks, times[3], bottom=times[2], label='gmg comp', width=w)
-plt.bar(ranks, times[1], bottom=times[2]+times[3], label='bottom', width=w)
-plt.bar(ranks, others, bottom=times[1]+times[2]+times[3], label='other',
-        color='gray', width=w)
+plt.bar(ranks, times[2], label='halo exchange', width=w)
+plt.bar(ranks, times[3], bottom=times[2], label='smoothing', width=w)
+plt.bar(ranks, times[1], bottom=times[2]+times[3], label='bottom solver', width=w)
 plt.legend(fontsize=16)
 plt.ylabel('Time(s)', fontsize=16)
 plt.xlabel('Rank',fontsize=16)
 plt.title('MG Breakdown', fontsize=16)
-
-# %%
