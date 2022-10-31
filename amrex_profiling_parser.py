@@ -152,8 +152,8 @@ class TreeNode:
 #-------------------------------------------------------------------
 
 
-def build_calltree_list(path, nProc, fileType='binary', endian='little', \
-                        longIntSize=8, main=None):
+def build_calltree_list(path, nProc=0, fileType='binary', endian='little', \
+                        longIntSize=8, main=None, procs=[]):
   '''
     Build call trees based on AMReX Base profiling, one tree per process.
 
@@ -178,14 +178,19 @@ def build_calltree_list(path, nProc, fileType='binary', endian='little', \
     prefix = '/bl_call_stats_H_'
   else:
     prefix = '/bl_call_stats_D_'
-
+    
+  assert nProc*len(procs) == 0 or len(procs) == nProc
+  ranks = procs if len(procs) > 0 else [i for i in range(nProc)]
+  
   roots = []
-  for i in range(nProc):
+  for i in ranks:
     fname = path + prefix + '{:05d}'.format(i)
-    roots.append(build_call_tree(fname, fileType=fileType, endian=endian, \
-                                 longIntSize=longIntSize, main=main))
+    roots.append(build_call_tree(fname, fileType=fileType,\
+                                 endian=endian,\
+                                 longIntSize=longIntSize, \
+                                 main=main))
     roots[-1].merge_same_subtrees()
-
+    
   return roots
 
 
@@ -269,7 +274,14 @@ def build_from_binary(fnameH, RegionType, CallType, main):
   funcIdNameMap = {}
   for line in lines[1:-1]:
     items = line.strip().split('"')
-    funcIdNameMap[int(items[2].strip())] = items[1]
+    try:
+      funcIdNameMap[int(items[2].strip())] = items[1]
+    except Exception as e:
+      print(str(e))
+      print("Error in", fnameH, line)
+      print(lines[-1])
+      print(lines[-2])
+      return
   fHeader.close()
 
   # read binary file to a buffer
@@ -461,123 +473,3 @@ def read_step_time(filepath):
         times['peff'].append(float(line.strip().split()[-1]))
 
   return times
-
-
-def read_function_time_base(filepath):
-  '''
-  Extract info from tiny profiling's summary in stdout.
-  '''
-  funcName  = []
-  timeStat  = {}
-  iTitle    = sys.maxsize # line number of titles
-  titles    = []
-  with open(filepath, 'r') as file:
-    for i, line in enumerate(file):
-      # first time see Total Times
-      # The title line is below this line
-      if line.find("Total times") != -1:
-        iTitle = i + 1
-      # ends at first blanck line after starting extraction
-      endExacting = i > iTitle and len(line.strip()) == 0
-      # extract titles,
-      # !!!! hardcodeed from 2 to -2 !!!!
-      if i == iTitle:
-        titles = line.strip().split()[2:-1]
-        for title in titles:
-          timeStat[title] = []
-      # starts extracting statistics after passing the title line
-      if i > iTitle and (not endExacting):
-        # words = line.strip().split('  ')
-        words = re.split('\s{2,}', line.strip())
-        # print(iTitle, words)
-        # statistics
-        for j, title in enumerate(titles):
-          timeStat[title].append(float(
-            words[j+1][:-2] if '%' in words[j+1] else words[j+1]))
-        # function name
-        funcName.append(words[0])
-      #
-      if endExacting: break
-
-  # print(timeStat)
-  #create the pandas dataframe
-  return pd.DataFrame(timeStat, index=funcName)
-
-
-def read_function_time_tiny(filepath, inclusive=False):
-  '''
-  Extract info from tiny profiling's summary in stdout.
-  '''
-  funcName  = []
-  timeStat  = {}
-  iTitle    = sys.maxsize # line number of titles
-  titles    = []
-  searchKey = 'Excl.' if not inclusive else 'Incl.'
-  with open(filepath, 'r') as file:
-    for i, line in enumerate(file):
-      # first time see Total Times
-      # The title line is below this line
-      if line.find(searchKey) != -1:
-        iTitle = i
-      # ends at first blanck line after starting extraction
-      endExacting = i > iTitle and len(line.strip()) == 0
-      # extract titles,
-      # !!!! hardcodeed from 1 to end !!!!
-      if i == iTitle:
-        titles = re.split('\s{2,}', line.strip())[1:]
-        for title in titles:
-          timeStat[title] = []
-      # starts extracting statistics after passing the title line
-      if i > iTitle and (not endExacting):
-        # words = line.strip().split('  ')
-        words = re.split('\s{2,}', line.strip())
-        if len(words) <= 1:
-          continue
-        # print(iTitle, words)
-        # statistics
-        for j, title in enumerate(titles):
-          timeStat[title].append(float(
-            words[j+1][:-2] if '%' in words[j+1] else words[j+1]))
-        # function name
-        funcName.append(words[0])
-      #
-      if endExacting: break
-
-  # print(timeStat)
-  #create the pandas dataframe
-  return pd.DataFrame(timeStat, index=funcName)
-
-
-def print_mg_time(df):
-  '''
-  Extract mg time at each layer from tiny profiling's summary.
-  '''
-  upTimes = []
-  downTimes = []
-  nLevel = 0
-  while 1:
-    upName = 'MLMG::mgVcycle_up::' + repr(nLevel)
-    if upName in df.index:
-      upTimes.append((df.loc[upName, 'Incl. Avg'], \
-                      df.loc[upName, 'Incl. Avg'] / df.loc[upName, 'Incl. Max']))
-      downName = 'MLMG::mgVcycle_down::' + repr(nLevel)
-      downTimes.append((df.loc[downName, 'Incl. Avg'], \
-                        df.loc[downName, 'Incl. Avg'] / df.loc[downName, 'Incl. Max']))
-      nLevel += 1
-    else:
-      break
-  # bottom time
-  name = 'MLMG::mgVcycle_bottom'
-  bottomTime = (df.loc[name, 'Incl. Avg'], \
-                df.loc[name, 'Incl. Avg'] / df.loc[name, 'Incl. Max'])
-  # print out levels' time
-  for i in range(nLevel):
-    sep    = 2*(nLevel - i) * '    '
-    indent = (i + 1) * '    '
-    print('{:d}{}({:.1f}, {:.1f}){}({:.1f}, {:.1f})'.format(i,\
-          indent, downTimes[i][0], downTimes[i][1],\
-          sep, upTimes[i][0], upTimes[i][1]))
-  # print out bottom time
-  indent = (nLevel + 3) * '    '
-  print('{:d}{}({:.1f}, {:.1f})'.format(nLevel, \
-         indent, bottomTime[0], bottomTime[1]))
