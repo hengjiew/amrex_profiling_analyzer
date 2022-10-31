@@ -1,6 +1,7 @@
 #%%
 import sys
 import matplotlib.pyplot as plt
+import matplotlib
 import numpy as np
 from amrex_profiling_parser import *
 
@@ -14,7 +15,12 @@ from amrex_profiling_parser import *
 # individual function calls. The call tree merges call paths with same function
 # names e.g., calls of the same function at different iterations.
 
-roots = build_calltree_list(path='../mfix_post/bl_prof_bin', nProc=18)
+roots = []
+# we can specify ranks to be extracted from the profiling file
+procs =  [i for i in range(4)] + [i for i in range(8,12)]
+roots.append(build_calltree_list(path='../cpuvsgpu/bl_64c', procs=procs))
+# we can also specify the # ranks. This will read rank 0-7 from file
+roots.append(build_calltree_list(path='../cpuvsgpu/bl_1g', nProc=8))
 
 # this also works if you profile the main function and name the profiler 'main()'.
 # roots = build_calltree_list(path='./bl_prof_bin', nProc=18, main='main()')
@@ -27,7 +33,7 @@ roots = build_calltree_list(path='../mfix_post/bl_prof_bin', nProc=18)
 # More usage of `print_callpath` can be found in its doc in amrex_prifliing_parser.py
 
 searchPath = ['FabArray::ParallelCopy_finish()']
-print_callpath(roots, searchPath, sortBy='time', pid=0, nPrint=4)
+print_callpath(roots[0], searchPath, sortBy='time', pid=0, nPrint=4)
 
 #%%
 # In some cases, we know a specfic high level function is very expensive. The following
@@ -41,16 +47,22 @@ print_callpath(roots, searchPath, sortBy='time', pid=0, nPrint=4)
 # outputs the costs the MG solver in mac projector. If the third function is omitted, it
 # will output MG sovler's statistics collected from both the mac and nodal projectors.
 
-# MG performance in mac projector
-callPath = ['mfix_solve','mfix::EvolveFluid',
-            'mfix::compute_MAC_projected_velocities()',
-            'MLMG::mgVcycle()']
-print_runtime(roots, callPath, depth=1, pid=4)
+# if pid=-1, it will output the results of all ranks
 
-# Each function's cost are is the sum over its calls in both mac and nodal projector.
-callPath = ['mfix_solve','mfix::EvolveFluid',
-            'MLMG::mgVcycle()']
-print_runtime(roots, callPath, depth=3, pid=4)
+callPath = ['mfix_solve', 'mfix::EvolveFluid',
+            'mfix::mfix_apply_predictor',
+            'mfix::mfix_apply_nodal_projection',
+            'MLMG::solve()', 'MLMG::mgVcycle()',
+            'MLMG::actualBottomSolve()',]
+
+print("----------------------------------------------------------------")
+print("cpu")
+print("----------------------------------------------------------------")
+print_runtime(roots[0], callPath, depth=4, pid=0)
+print("----------------------------------------------------------------")
+print("gpu")
+print("----------------------------------------------------------------")
+print_runtime(roots[1], callPath, depth=4, pid=0)
 
 # %%
 # This module comes handy when one wants to generate performance plots for slides/reports.
@@ -61,25 +73,30 @@ print_runtime(roots, callPath, depth=3, pid=4)
 # Assuming we indentifies the hotspots of the particle solver from previous steps, we can
 # plot the per process usage for further analysis.
 callPaths = [
-  ['mfix_solve', 'mfix_dem::EvolveParticles()',],
-  ['mfix_solve', 'mfix_dem::EvolveParticles()','particles_computation'],
-  ['mfix_solve', 'mfix_dem::EvolveParticles()', 'NeighborParticleContainer::updateNeighborsGPU'],
+    ['mfix_solve','mfix_dem::EvolveParticles()',],
+    ['mfix_solve','mfix_dem::EvolveParticles()','particles_computation'],    
+    ['mfix_solve','mfix_dem::EvolveParticles()',
+     'NeighborParticleContainer::updateNeighborsGPU',],
+    ['mfix_solve','mfix_dem::EvolveParticles()',
+     'ParticleContainer::RedistributeGPU()',],
 ]
+r     = 1
+nProc = len(roots[r])
+t     = extract_runtime(roots[r], callPaths)
+tTot  = t[0]
+tComp = t[1]
+tComm = t[2] + t[3]
 
-
-times = extract_runtime(roots, callPaths)
-
-fig   =plt.figure(figsize=(8,4))
-nProc = 18 # number of process
-x     = [i for i in range(nProc)]
+fig   = plt.figure(figsize=(8,4))
+x     = np.arange(nProc)
 plt.xticks(x, x)
-plt.title("Particle Solver's Performance")
+plt.title("Particle Solver's Performance on {:d} GPUs".format(nProc))
 plt.ylabel('Time(s)', fontsize=12)
 plt.xlabel('Rank, 1 GPU per rank', fontsize=12)
 
-plt.plot(times[0], 'b-', label='EvolveParticles',   fillstyle='none')
-plt.plot(times[1], 'bs', label='computation',       markersize=6, fillstyle='none')
-plt.plot(times[2], 'bo', label='updateNeighborGPU', markersize=6, fillstyle='none')
+plt.plot(tTot,  'b-', label='EvolveParticles',   fillstyle='none')
+plt.plot(tComp, 'bs', label='computation',   markersize=6, fillstyle='none')
+plt.plot(tComm, 'bo', label='communication', markersize=6, fillstyle='none')
 plt.legend(fontsize=12, bbox_to_anchor=(1.02, 1))
 
 # %%
@@ -91,27 +108,76 @@ plt.legend(fontsize=12, bbox_to_anchor=(1.02, 1))
 # by part of the processes. So the plot may present a significant imbalance, which
 # is not necessarily a performance hit.
 
-callPaths = [
-  ['mfix::compute_MAC_projected_velocities()', 'MLMG::mgVcycle()',],
-  ['mfix::compute_MAC_projected_velocities()', 'MLMG::mgVcycle()',
-   'MLMG::mgVcycle_bottom',],
-  ['mfix::compute_MAC_projected_velocities()', 'MLMG::mgVcycle()',
-   'MLEBABecLap::applyBC()', 'FabArray::FillBoundary()',],
-  ['mfix::compute_MAC_projected_velocities()', 'MLMG::mgVcycle()',
-   'MLEBABecLap::Fsmooth()',],
-]
+top = 'mfix::mfix_apply_nodal_projection'
+mg  = 'MLMG::mgVcycle()'
+down= 'MLMG::mgVcycle_down::'
+up  = 'MLMG::mgVcycle_up::'
+FB  = 'FabArray::FillBoundary()'
+PC  = 'FabArray::ParallelCopy()'
+r   = 0
 
-times = extract_runtime(roots, callPaths)
-nProc  = 18
+# total and bottom
+callPaths = [[top, 'MLMG::mgVcycle()',],
+             [top, 'MLMG::mgVcycle()', 'MLMG::mgVcycle_bottom',],]
+times     = extract_runtime(roots[r], callPaths)
+tTotal    = times[0]
+tBott     = times[1]
 
-w = 0.6
+# communication
+nProc     = len(tTotal)
+nLev      = 5
+callPaths = []
+for i in range(nLev): 
+  callPaths.append([top, down+repr(i), FB])
+  callPaths.append([top, up  +repr(i), FB])
+times     = extract_runtime(roots[r], callPaths)
+tFB       = sum(times)
+callPaths = [[top, mg, PC],]
+times     = extract_runtime(roots[r], callPaths)
+tPC       = times[0]
+tComm     = tFB + tPC
+
+# computation
+callPaths = []
+for i in range(nLev):
+  callPaths.append([top, down+repr(i), 'MLNodeLaplacian::Fsmooth()'])
+  callPaths.append([top, up  +repr(i), 'MLNodeLaplacian::Fsmooth()'])
+for i in range(nLev):
+  callPaths.append([top, down+repr(i), 'MLMG:computeResOfCorrection()'])
+  callPaths.append([top, down+repr(i), 'MLMG:computeResOfCorrection()', FB])
+#
+callPaths.append([top, mg, 'MLNodeLaplacian::restriction()'])
+callPaths.append([top, mg, 'MLNodeLaplacian::restriction()', PC])
+callPaths.append([top, mg, 'MLNodeLaplacian::restriction()', FB])
+callPaths.append([top, mg, 'MLMG::addInterpCorrection()'])
+callPaths.append([top, mg, 'MLMG::addInterpCorrection()', PC]) 
+times    = extract_runtime(roots[r], callPaths)
+tComp    = sum(times[:2*nLev])
+for i in range(2*nLev, 4*nLev, 2):
+  tComp += times[i] - times[i+1]
+i        = 4*nLev
+tComp   += times[i] - times[i+1] - times[i+2]
+tComp   += times[i+3] - times[i+4]
+
+tOther   = tTotal - tComm - tBott - tComp
+# print(tOther)
+
 ranks = [repr(i) for i in range(nProc)]
-others = times[0]-times[1]-times[2]-times[3]
-fig = plt.figure(figsize=(8,4))
-plt.bar(ranks, times[2], label='halo exchange', width=w)
-plt.bar(ranks, times[3], bottom=times[2], label='smoothing', width=w)
-plt.bar(ranks, times[1], bottom=times[2]+times[3], label='bottom solver', width=w)
-plt.legend(fontsize=16)
+w     = 0.6
+
+fig = plt.figure(figsize=(12,4))
+plt.bar(ranks, tFB, label='FB', width=w)
+plt.bar(ranks, tPC, bottom=tFB, label='PC', width=w)
+plt.bar(ranks, tComp,  bottom=tComm, label='comp', width=w)
+plt.bar(ranks, tBott,  bottom=tComm+tComp, label='bottom', width=w)
+plt.bar(ranks, tOther, bottom=tComm+tComp+tBott, label='other', width=w)
+plt.xlim(-1, nProc)
+plt.ylim(0.0, np.amax(tTotal)+0.5)
+plt.legend(fontsize=12)
 plt.ylabel('Time(s)', fontsize=16)
 plt.xlabel('Rank',fontsize=16)
-plt.title('MG Breakdown', fontsize=16)
+plt.title('MG {:d} Breakdown'.format(r), fontsize=16)
+# print(np.amax(tTotal), np.amin(tTotal))
+# print("rank 0 - {:.4e} {:.4e} {:.4e} {:.4e}".format(tTotal[-1], tComp[-1], tComm[-1], tBott[-1]))
+
+
